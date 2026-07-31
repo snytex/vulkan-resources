@@ -1,0 +1,8 @@
+-std=c++20
+-Wall
+-Wextra
+-Wno-missing-field-initializers
+-I.
+-Isrc
+-Isrc/vendor/imgui
+-I/usr/local/include
