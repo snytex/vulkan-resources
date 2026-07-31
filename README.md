@@ -10,5 +10,7 @@ thats it i only used these
 
 ## Vulkan
 https://docs.vulkan.org official documentation by khronos group
+
 https://vkguide.dev this one i'd recommend if you want to learn about the modern vk 1.3 features such as dynamic rendering
+
 https://www.howtovulkan.com if you don't know where to start this could be good (though i haven't used this one myself)
