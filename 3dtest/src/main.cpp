@@ -1257,6 +1257,7 @@ auto sn_main(SN_MAIN_ARGS) -> sn::Exit
   }
   catch (const std::exception& e)
   {
+    // we aint even gonna use e here lololol
     return sn::Exit::fail("Fatal error");
   }
 
