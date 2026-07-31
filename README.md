@@ -1,4 +1,4 @@
-# vulkan-tests
+# vulkan-resources
 This will be a collection of some of my vulkan projects i'm making as I learn about graphics programming
 ## Note: These will under no circumstances be perfect in any way. This is for my own educational purpose and none of these projects are taken seriously.
 
