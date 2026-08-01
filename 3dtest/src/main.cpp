@@ -1203,7 +1203,7 @@ class Application
 
         if (++frames, now - fpsTimer >= 1.0)
         {
-          std::string title = "Alloy Engine Render Pipeline Test v2026.07.31 | " + std::to_string(frames) + " fps";
+          std::string title = "Render Pipeline Test | " + std::to_string(frames) + " fps";
           glfwSetWindowTitle(window, title.c_str());
           frames = 0;
           fpsTimer = now;
