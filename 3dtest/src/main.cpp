@@ -1191,7 +1191,7 @@ class Application
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Debug");
+        ImGui::Begin("Debug (F1 to toggle)");
         ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
         ImGui::DragFloat3("cam", &camera.position.x, 0.1f);
         ImGui::SliderFloat("fov", &camera.fovY, 30.0f, 110.0f);
