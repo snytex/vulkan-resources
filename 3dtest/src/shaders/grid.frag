@@ -7,6 +7,9 @@ layout(push_constant) uniform PushConstants
 {
   mat4 viewProj;
   vec4 camPosFog;
+  vec4 camRightTan;
+  vec4 camUpAspect;
+  vec4 camFwdTime;
 } pc;
 
 layout(location = 0) out vec4 outColor;

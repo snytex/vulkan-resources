@@ -6,7 +6,10 @@ layout(location = 1) in vec3 inColor;
 layout(push_constant) uniform PushConstants
 {
   mat4 viewProj;
-  vec4 camPosFog; // xyz = cam pos, w = fog dens
+  vec4 camPosFog;   // xyz = cam pos, w = fog dens
+  vec4 camRightTan; // xyz = right,   w = tan(fovY * 0.5)
+  vec4 camUpAspect; // xyz = up,      w = aspect
+  vec4 camFwdTime;  // xyz = forward, w = elapsed seconds
 } pc;
 
 layout(location = 0) out vec3 vColor;

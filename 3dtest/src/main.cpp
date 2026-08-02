@@ -1,4 +1,6 @@
 // clang-format off
+#define NDEBUG
+
 #include <sn/core.hpp>
 #include <sn/io.hpp>
 
@@ -37,6 +39,8 @@ static constexpr i32 kFramesInFlight = 2;
 static constexpr i32 kGridHalfExtent = 200;
 static constexpr f32 kGridSpacing = 1.0f;
 static constexpr f32 kFogDensity = 0.010f;
+
+static constexpr u32 kParticleCount = 90000;
 
 #ifdef NDEBUG
 static constexpr bool kEnableValidation = false;
@@ -98,8 +102,12 @@ struct Vertex
 struct PushConstants
 {
   glm::mat4 viewProj;
-  glm::vec4 camPosFog; // xyz = camera world position, w = fog density
+  glm::vec4 camPosFog;   // xyz = camera world position, w = fog density
+  glm::vec4 camRightTan; // xyz = camera right,          w = tan(fovY * 0.5)
+  glm::vec4 camUpAspect; // xyz = camera up,             w = aspect ratio
+  glm::vec4 camFwdTime;  // xyz = camera forward,        w = elapsed seconds
 };
+static_assert(sizeof(PushConstants) == 128, "push constants must fit the guaranteed 128 byte range");
 
 struct Camera
 {
@@ -181,6 +189,7 @@ class Application
     VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkPhysicalDevice pDevice = VK_NULL_HANDLE;
+    std::string gpuName;
     VkDevice device = VK_NULL_HANDLE;
     u32 graphicsFamily = 0, presentFamily = 0;
     VkQueue graphicsQueue = VK_NULL_HANDLE, presentQueue = VK_NULL_HANDLE;
@@ -191,6 +200,7 @@ class Application
     VkExtent2D swapchainExtent{};
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
+    std::string activeMode;
 
     // --- depth ---
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
@@ -200,7 +210,14 @@ class Application
 
     // --- pipeline ---
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;         // grid + boxes, line list
+    VkPipeline skyPipeline = VK_NULL_HANDLE;      // procedural nebula, fullscreen triangle
+    VkPipeline particlePipeline = VK_NULL_HANDLE; // additive billboards, no vertex buffer
+
+    // --- scene state ---
+    f32 elapsed = 0.0f;
+    bool drawSky = true;
+    bool drawParticles = true;
 
     // --- geometry ---
     VkBuffer vertexBuffer = VK_NULL_HANDLE;
@@ -287,7 +304,7 @@ class Application
       createSwapchain();
       createImageViews();
       createDepthResources();
-      createPipeline();
+      createPipelines();
       createGeometry();
       createCommandPool();
       createCommandBuffers();
@@ -454,6 +471,7 @@ class Application
         if (pDevice == VK_NULL_HANDLE || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
         {
           pDevice = dev;
+          gpuName = props.deviceName;
           if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) break;
         }
       }
@@ -532,6 +550,13 @@ class Application
       VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR; // default; always available
       for (auto m : modes)
         if (m == VK_PRESENT_MODE_MAILBOX_KHR) { presentMode = m; break; }
+      switch (presentMode)
+      {
+        case VK_PRESENT_MODE_FIFO_KHR: activeMode = "FIFO (VSync)"; break;
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: activeMode = "FIFO (Relaxed)"; break;
+        case VK_PRESENT_MODE_MAILBOX_KHR: activeMode = "Mailbox (Triple Buffer)"; break;
+        default: activeMode = "other"; break;
+      }
 
       VkExtent2D extent = caps.currentExtent;
       if (extent.width == std::numeric_limits<u32>::max())
@@ -678,10 +703,50 @@ class Application
       return mod;
     }
 
-    void createPipeline()
+    struct PipelineOptions
     {
-      VkShaderModule vert = createShaderModule(readFile("shaders/grid.vert.spv"));
-      VkShaderModule frag = createShaderModule(readFile("shaders/grid.frag.spv"));
+      VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      bool vertexInput = true;  // false -> geometry synthesised from gl_VertexIndex
+      bool depthTest = true;
+      bool depthWrite = true;
+      bool additive = false;
+    };
+
+    void createPipelines()
+    {
+      // one layout for every pass; push constants survive pipeline rebinds
+      VkPushConstantRange push{};
+      push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+      push.offset = 0;
+      push.size = sizeof(PushConstants);
+
+      VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      lci.pushConstantRangeCount = 1;
+      lci.pPushConstantRanges = &push;
+      VK_CHECK(vkCreatePipelineLayout(device, &lci, nullptr, &pipelineLayout));
+
+      pipeline = buildPipeline("shaders/grid.vert.spv", "shaders/grid.frag.spv", {});
+
+      PipelineOptions skyOpts{};
+      skyOpts.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      skyOpts.vertexInput = false;
+      skyOpts.depthTest = false;
+      skyOpts.depthWrite = false;
+      skyPipeline = buildPipeline("shaders/sky.vert.spv", "shaders/sky.frag.spv", skyOpts);
+
+      PipelineOptions particleOpts{};
+      particleOpts.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      particleOpts.vertexInput = false;
+      particleOpts.depthTest = true;
+      particleOpts.depthWrite = false; // sprites must blend with each other
+      particleOpts.additive = true;
+      particlePipeline = buildPipeline("shaders/particle.vert.spv", "shaders/particle.frag.spv", particleOpts);
+    }
+
+    VkPipeline buildPipeline(const char* vertPath, const char* fragPath, const PipelineOptions& opts)
+    {
+      VkShaderModule vert = createShaderModule(readFile(vertPath));
+      VkShaderModule frag = createShaderModule(readFile(fragPath));
 
       VkPipelineShaderStageCreateInfo stages[2]{};
       stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -696,13 +761,16 @@ class Application
       auto binding = Vertex::bindingDescription();
       auto attribs = Vertex::attributeDescriptions();
       VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-      vi.vertexBindingDescriptionCount = 1;
-      vi.pVertexBindingDescriptions = &binding;
-      vi.vertexAttributeDescriptionCount = static_cast<u32>(attribs.size());
-      vi.pVertexAttributeDescriptions = attribs.data();
+      if (opts.vertexInput)
+      {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &binding;
+        vi.vertexAttributeDescriptionCount = static_cast<u32>(attribs.size());
+        vi.pVertexAttributeDescriptions = attribs.data();
+      }
 
       VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-      ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      ia.topology = opts.topology;
 
       VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
       vp.viewportCount = 1;
@@ -718,8 +786,8 @@ class Application
       ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
       VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-      ds.depthTestEnable = VK_TRUE;
-      ds.depthWriteEnable = VK_TRUE;
+      ds.depthTestEnable = opts.depthTest ? VK_TRUE : VK_FALSE;
+      ds.depthWriteEnable = opts.depthWrite ? VK_TRUE : VK_FALSE;
       ds.depthCompareOp = VK_COMPARE_OP_LESS;
       ds.maxDepthBounds = 1.0f;
 
@@ -727,7 +795,16 @@ class Application
       blendAttachment.colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-      blendAttachment.blendEnable = VK_FALSE;
+      blendAttachment.blendEnable = opts.additive ? VK_TRUE : VK_FALSE;
+      if (opts.additive) // sprites are pre-multiplied in the fragment shader
+      {
+        blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+      }
 
       VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
       cb.attachmentCount = 1;
@@ -737,16 +814,6 @@ class Application
       VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
       dyn.dynamicStateCount = 2;
       dyn.pDynamicStates = dynamics;
-
-      VkPushConstantRange push{};
-      push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-      push.offset = 0;
-      push.size = sizeof(PushConstants);
-
-      VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-      lci.pushConstantRangeCount = 1;
-      lci.pPushConstantRanges = &push;
-      VK_CHECK(vkCreatePipelineLayout(device, &lci, nullptr, &pipelineLayout));
 
       // replacement for render pass
       VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -769,10 +836,12 @@ class Application
       pci.layout = pipelineLayout;
       pci.renderPass = VK_NULL_HANDLE;
 
-      VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline));
+      VkPipeline result = VK_NULL_HANDLE;
+      VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, &result));
 
       vkDestroyShaderModule(device, frag, nullptr);
       vkDestroyShaderModule(device, vert, nullptr);
+      return result;
     }
 
     // ------------------------------------------------------------------------
@@ -807,7 +876,7 @@ class Application
       std::vector<Vertex> verts;
       const f32 extent = kGridHalfExtent * kGridSpacing;
       const glm::vec3 minor(0.16f, 0.18f, 0.22f);
-      const glm::vec3 major(0.32f, 0.36f, 0.44f);
+      const glm::vec3 major(0.32f, 0.36f, 0.44f); // joe
 
       for (i32 i = -kGridHalfExtent; i <= kGridHalfExtent; ++i)
       {
@@ -827,8 +896,8 @@ class Application
       std::mt19937 rng(1337);
       std::uniform_real_distribution<f32> posDist(-extent * 0.65f, extent * 0.65f);
       std::uniform_real_distribution<f32> sizeDist(1.5f, 6.0f);
-      std::uniform_real_distribution<f32> hDist(0.0f, 18.0f);
-      for (i32 i = 0; i < 90; ++i)
+      std::uniform_real_distribution<f32> hDist(0.0f, 180.0f);
+      for (i32 i = 0; i < 150; ++i)
       {
         f32 s = sizeDist(rng);
         glm::vec3 half(s, s * 0.8f, s);
@@ -978,22 +1047,44 @@ class Application
       VkRect2D scissor{{0, 0}, swapchainExtent};
       vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-      VkDeviceSize offset = 0;
-      vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
-
       f32 aspect = swapchainExtent.height == 0 ? 1.0f : f32(swapchainExtent.width) / f32(swapchainExtent.height);
-      glm::mat4 proj = glm::perspective(glm::radians(camera.fovY), aspect, 0.1f, 600.f);
+      glm::mat4 proj = glm::perspective(glm::radians(camera.fovY), aspect, 0.1f, 2000.f);
       proj[1][1] *= -1.0f; // vulkan clipspace -> +y = down
-      
+
+      glm::vec3 fwd = camera.forward();
+      glm::vec3 rgt = camera.right();
+      glm::vec3 up = glm::normalize(glm::cross(rgt, fwd));
+
       PushConstants pc{};
       pc.viewProj = proj * camera.view();
       pc.camPosFog = glm::vec4(camera.position, kFogDensity);
+      pc.camRightTan = glm::vec4(rgt, std::tan(glm::radians(camera.fovY) * 0.5f));
+      pc.camUpAspect = glm::vec4(up, aspect);
+      pc.camFwdTime = glm::vec4(fwd, elapsed);
+
+      // one push for every pass: same layout, so it persists across binds
       vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
           0, sizeof(PushConstants), &pc);
 
+      // background: raymarched nebula + stars, no depth interaction
+      if (drawSky)
+      {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipeline);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+      }
+
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      VkDeviceSize offset = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
       vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+
+      // foreground: procedural billboards, 6 verts per instance, additive
+      if (drawParticles)
+      {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, particlePipeline);
+        vkCmdDraw(cmd, 6, kParticleCount, 0, 0);
+      }
+
       ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
       vkCmdEndRendering(cmd);
 
@@ -1184,6 +1275,7 @@ class Application
         f32 dt = static_cast<f32>(now - last);
         last = now;
         dt = std::min(dt, 0.1f);
+        elapsed += dt;
 
         updateCamera(dt);
 
@@ -1192,9 +1284,15 @@ class Application
         ImGui::NewFrame();
 
         ImGui::Begin("Debug (F1 to toggle)");
-        ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
+        ImGui::Text("%1.f FPS", ImGui::GetIO().Framerate);
+        ImGui::Text("GPU: %s", gpuName.c_str());
+        ImGui::Text("Present Mode: %s", activeMode.c_str());
         ImGui::DragFloat3("cam", &camera.position.x, 0.1f);
         ImGui::SliderFloat("fov", &camera.fovY, 30.0f, 110.0f);
+        ImGui::Separator();
+        ImGui::Checkbox("nebula sky", &drawSky);
+        ImGui::Checkbox("particles", &drawParticles);
+        ImGui::Text("%u sprites", kParticleCount);
         ImGui::End();
 
         ImGui::Render();
@@ -1203,7 +1301,7 @@ class Application
 
         if (++frames, now - fpsTimer >= 1.0)
         {
-          std::string title = "Render Pipeline Test | " + std::to_string(frames) + " fps";
+          std::string title = "Alloy Engine Render Pipeline Test v2026.07.31 | " + std::to_string(frames) + " fps";
           glfwSetWindowTitle(window, title.c_str());
           frames = 0;
           fpsTimer = now;
@@ -1228,6 +1326,8 @@ class Application
         vkDestroyCommandPool(device, commandPool, nullptr);
         vkDestroyBuffer(device, vertexBuffer, nullptr);
         vkFreeMemory(device, vertexMemory, nullptr);
+        vkDestroyPipeline(device, particlePipeline, nullptr);
+        vkDestroyPipeline(device, skyPipeline, nullptr);
         vkDestroyPipeline(device, pipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         ImGui_ImplVulkan_Shutdown();
@@ -1257,7 +1357,6 @@ auto sn_main(SN_MAIN_ARGS) -> sn::Exit
   }
   catch (const std::exception& e)
   {
-    // we aint even gonna use e here lololol
     return sn::Exit::fail("Fatal error");
   }
 
